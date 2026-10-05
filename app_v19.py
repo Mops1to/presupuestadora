@@ -262,9 +262,15 @@ def init_db():
 
     c.execute("""CREATE TABLE IF NOT EXISTS facturas_clientes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        proyecto_id INTEGER NOT NULL REFERENCES proyectos(id),
+        proyecto_id INTEGER REFERENCES proyectos(id),
+        cliente_nombre TEXT,
         numero TEXT, importe REAL, fecha TEXT,
-        estado_cobro TEXT, referencia_archivo TEXT
+        fecha_vencimiento TEXT,
+        estado_cobro TEXT DEFAULT 'pendiente',
+        referencia_archivo TEXT,
+        archivo TEXT,
+        notas TEXT,
+        creado_en TEXT DEFAULT (datetime('now'))
     )""")
 
     c.execute("""CREATE TABLE IF NOT EXISTS horas (
@@ -517,6 +523,72 @@ def init_db():
                 restringidos.append("mi-piso")
             c.execute("UPDATE usuarios SET modulos_restringidos=? WHERE id=?", (json.dumps(restringidos), row[0]))
         _marcar_migracion_hecha("mi_piso_privado_por_defecto")
+
+    if _migracion_pendiente("facturas_clientes_sin_proyecto_obligatorio"):
+        # La tabla vieja exigía proyecto_id (NOT NULL) y no tenía sitio para
+        # el nombre del cliente, ni para el vencimiento — hace falta
+        # reconstruirla entera, SQLite no permite quitar un NOT NULL con
+        # ALTER. Se reconstruye conservando todo lo que ya hubiera.
+        cols_fc = [r[1] for r in c.execute("PRAGMA table_info(facturas_clientes)").fetchall()]
+        if "cliente_nombre" not in cols_fc:
+            c.execute("ALTER TABLE facturas_clientes RENAME TO facturas_clientes_old")
+            c.execute("""CREATE TABLE facturas_clientes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                proyecto_id INTEGER REFERENCES proyectos(id),
+                cliente_nombre TEXT,
+                numero TEXT, importe REAL, fecha TEXT,
+                fecha_vencimiento TEXT,
+                estado_cobro TEXT DEFAULT 'pendiente',
+                referencia_archivo TEXT,
+                archivo TEXT,
+                notas TEXT,
+                creado_en TEXT DEFAULT (datetime('now'))
+            )""")
+            c.execute("""INSERT INTO facturas_clientes
+                (id, proyecto_id, numero, importe, fecha, estado_cobro, referencia_archivo)
+                SELECT id, proyecto_id, numero, importe, fecha, estado_cobro, referencia_archivo
+                FROM facturas_clientes_old""")
+            c.execute("DROP TABLE facturas_clientes_old")
+        _marcar_migracion_hecha("facturas_clientes_sin_proyecto_obligatorio")
+
+    # Ventas menores (Vinted y similares) — registro rápido, sin factura de
+    # verdad detrás, totalmente aparte de todo lo demás.
+    c.execute("""CREATE TABLE IF NOT EXISTS ventas_menores (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        fecha TEXT NOT NULL,
+        plataforma TEXT,
+        comprador TEXT,
+        producto TEXT,
+        coste_fabricacion REAL DEFAULT 0,
+        coste_venta REAL NOT NULL,
+        margen_myrox REAL DEFAULT 0,
+        vendedor TEXT,
+        notas TEXT,
+        creado_en TEXT DEFAULT (datetime('now'))
+    )""")
+    # Migración: si ya existía con el esquema viejo (concepto/precio, sin
+    # coste_fabricacion/coste_venta/margen_myrox), se reconstruye
+    # conservando lo que hubiera — no debería haber datos reales todavía,
+    # pero por si acaso ya probaste algo.
+    cols_vm = [r[1] for r in c.execute("PRAGMA table_info(ventas_menores)").fetchall()]
+    if "producto" not in cols_vm:
+        c.execute("ALTER TABLE ventas_menores RENAME TO ventas_menores_old")
+        c.execute("""CREATE TABLE ventas_menores (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fecha TEXT NOT NULL,
+            plataforma TEXT,
+            comprador TEXT,
+            producto TEXT,
+            coste_fabricacion REAL DEFAULT 0,
+            coste_venta REAL NOT NULL,
+            margen_myrox REAL DEFAULT 0,
+            vendedor TEXT,
+            notas TEXT,
+            creado_en TEXT DEFAULT (datetime('now'))
+        )""")
+        c.execute("""INSERT INTO ventas_menores (id, fecha, plataforma, comprador, producto, coste_venta, vendedor, notas)
+            SELECT id, fecha, plataforma, comprador, concepto, precio, vendedor, notas FROM ventas_menores_old""")
+        c.execute("DROP TABLE ventas_menores_old")
 
     conn.commit()
     conn.close()
@@ -2942,9 +3014,131 @@ def contabilidad_resumen(u: dict = Depends(_requerir_modulo("contabilidad"))):
 def contabilidad_ingresos(u: dict = Depends(_requerir_modulo("contabilidad"))):
     conn = get_db()
     rows = conn.execute("""
-        SELECT fc.*, p.codigo AS proyecto_codigo, p.nombre AS proyecto_nombre
-        FROM facturas_clientes fc JOIN proyectos p ON p.id = fc.proyecto_id
+        SELECT fc.*, p.codigo AS proyecto_codigo, p.nombre AS proyecto_nombre,
+               COALESCE(fc.cliente_nombre, c.nombre) AS cliente_final
+        FROM facturas_clientes fc
+        LEFT JOIN proyectos p ON p.id = fc.proyecto_id
+        LEFT JOIN clientes c ON c.id = p.cliente_id
         ORDER BY fc.fecha DESC
     """).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+@app.post("/facturas-emitidas/importar")
+async def importar_factura_emitida(request: Request):
+    d = await request.json()
+    conn = get_db()
+    existente = conn.execute("SELECT id FROM facturas_clientes WHERE archivo=?", (d.get("archivo"),)).fetchone()
+    if not existente and d.get("numero") and d.get("importe") is not None:
+        existente = conn.execute(
+            "SELECT id FROM facturas_clientes WHERE numero=? AND ABS(importe - ?) < 0.01",
+            (d["numero"], d["importe"])).fetchone()
+    if existente:
+        conn.close()
+        return {"status": "duplicada", "factura_id": existente["id"]}
+    cur = conn.execute("""INSERT INTO facturas_clientes
+        (cliente_nombre, numero, importe, fecha, fecha_vencimiento, estado_cobro, archivo)
+        VALUES (?,?,?,?,?,'pendiente',?)""",
+        (d.get("cliente_nombre"), d.get("numero"), d.get("importe"), d.get("fecha"),
+         d.get("fecha_vencimiento"), d.get("archivo")))
+    conn.commit()
+    new_id = cur.lastrowid
+    conn.close()
+    return {"status": "saved", "factura_id": new_id}
+
+@app.patch("/facturas-clientes/{factura_id}/cobrado")
+async def marcar_factura_cliente_cobrada(factura_id: int, request: Request):
+    d = await request.json()
+    conn = get_db()
+    conn.execute("UPDATE facturas_clientes SET estado_cobro=? WHERE id=?",
+                 ("cobrado" if d.get("cobrado") else "pendiente", factura_id))
+    conn.commit()
+    conn.close()
+    return {"status": "saved"}
+
+def _venta_menor_con_comision(row):
+    v = dict(row)
+    v["comision_personal"] = round((v["coste_venta"] or 0) - (v["coste_fabricacion"] or 0) - (v["margen_myrox"] or 0), 2)
+    return v
+
+@app.get("/ventas-menores")
+def listar_ventas_menores(request: Request, u: dict = Depends(_requerir_modulo("ventas-menores"))):
+    usuario = _requerir_usuario(request)
+    conn = get_db()
+    if usuario["rol"] == "master":
+        # El master ve todas, de todo el mundo — es el único control central.
+        rows = conn.execute("SELECT * FROM ventas_menores ORDER BY fecha DESC").fetchall()
+    else:
+        # Cualquier otra persona solo ve las suyas — ni rastro de las de los demás.
+        rows = conn.execute("SELECT * FROM ventas_menores WHERE vendedor=? ORDER BY fecha DESC",
+                             (usuario["nombre"],)).fetchall()
+    conn.close()
+    return [_venta_menor_con_comision(r) for r in rows]
+
+@app.post("/ventas-menores")
+async def crear_venta_menor(request: Request, u: dict = Depends(_requerir_modulo("ventas-menores"))):
+    usuario = _requerir_usuario(request)
+    d = await request.json()
+    if not d.get("fecha") or d.get("coste_venta") is None:
+        raise HTTPException(400, "Faltan datos obligatorios (fecha, coste de venta)")
+    conn = get_db()
+    # El vendedor SIEMPRE sale de la sesión autenticada, nunca de lo que
+    # mande el cliente. El margen Myrox solo lo puede fijar el master al
+    # crear la venta — cualquier otra persona la registra con margen 0,
+    # a la espera de que tú lo pongas según el acuerdo al que llegues.
+    margen = d.get("margen_myrox") if usuario["rol"] == "master" else 0
+    cur = conn.execute("""INSERT INTO ventas_menores
+        (fecha, plataforma, comprador, producto, coste_fabricacion, coste_venta, margen_myrox, vendedor, notas)
+        VALUES (?,?,?,?,?,?,?,?,?)""",
+        (d["fecha"], d.get("plataforma"), d.get("comprador"), d.get("producto"),
+         d.get("coste_fabricacion") or 0, d["coste_venta"], margen or 0, usuario["nombre"], d.get("notas")))
+    conn.commit()
+    new_id = cur.lastrowid
+    conn.close()
+    return {"status": "saved", "id": new_id}
+
+@app.patch("/ventas-menores/{venta_id}")
+async def editar_venta_menor(venta_id: int, request: Request, u: dict = Depends(_requerir_modulo("ventas-menores"))):
+    usuario = _requerir_usuario(request)
+    d = await request.json()
+    conn = get_db()
+    venta = conn.execute("SELECT vendedor FROM ventas_menores WHERE id=?", (venta_id,)).fetchone()
+    if not venta:
+        conn.close(); raise HTTPException(404, "Venta no encontrada")
+    es_master = usuario["rol"] == "master"
+    es_propia = venta["vendedor"] == usuario["nombre"]
+    if not es_master and not es_propia:
+        conn.close(); raise HTTPException(403, "Solo puedes editar tus propias ventas")
+
+    sets, valores = [], []
+    # El margen Myrox es el único campo que exige ser master, siempre —
+    # aunque sea tu propia venta, si no eres master no se toca.
+    if "margen_myrox" in d:
+        if not es_master:
+            conn.close(); raise HTTPException(403, "Solo el usuario master puede editar el margen Myrox")
+        sets.append("margen_myrox=?"); valores.append(d["margen_myrox"])
+    for campo in ("fecha", "plataforma", "comprador", "producto", "coste_fabricacion", "coste_venta", "notas"):
+        if campo in d:
+            sets.append(f"{campo}=?"); valores.append(d[campo])
+    if not sets:
+        conn.close()
+        return {"status": "sin cambios"}
+    valores.append(venta_id)
+    conn.execute(f"UPDATE ventas_menores SET {', '.join(sets)} WHERE id=?", valores)
+    conn.commit()
+    conn.close()
+    return {"status": "saved"}
+
+@app.delete("/ventas-menores/{venta_id}")
+def borrar_venta_menor(venta_id: int, request: Request, u: dict = Depends(_requerir_modulo("ventas-menores"))):
+    usuario = _requerir_usuario(request)
+    conn = get_db()
+    venta = conn.execute("SELECT vendedor FROM ventas_menores WHERE id=?", (venta_id,)).fetchone()
+    if not venta:
+        conn.close(); raise HTTPException(404, "Venta no encontrada")
+    if usuario["rol"] != "master" and venta["vendedor"] != usuario["nombre"]:
+        conn.close(); raise HTTPException(403, "Solo puedes borrar tus propias ventas")
+    conn.execute("DELETE FROM ventas_menores WHERE id=?", (venta_id,))
+    conn.commit()
+    conn.close()
+    return {"status": "deleted"}

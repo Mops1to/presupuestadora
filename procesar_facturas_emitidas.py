@@ -28,6 +28,7 @@ import unicodedata
 import requests
 from datetime import datetime
 from urllib.parse import quote, unquote
+import guardia_claude
 
 NEXTCLOUD_URL = os.environ["NEXTCLOUD_URL"].rstrip("/")
 NEXTCLOUD_USER = os.environ["NEXTCLOUD_USER"]
@@ -35,6 +36,13 @@ NEXTCLOUD_APP_PASSWORD = os.environ["NEXTCLOUD_APP_PASSWORD"]
 MYROX_API_URL = os.environ["MYROX_API_URL"].rstrip("/")
 CLAUDE_CODE_BIN = os.environ.get("CLAUDE_CODE_BIN", "/usr/bin/claude")
 CLAUDE_CODE_TIMEOUT = int(os.environ.get("CLAUDE_CODE_TIMEOUT", "120"))
+# Sin fijar modelo, `claude -p` usa el que tenga la cuenta por defecto (puede ser
+# el más caro). Para extraer datos de una factura basta uno intermedio.
+CLAUDE_CODE_MODEL = os.environ.get("CLAUDE_CODE_MODEL", "sonnet")
+CLAUDE_CODE_MAX_TURNS = os.environ.get("CLAUDE_CODE_MAX_TURNS", "6")
+# Solo estos tipos de archivo se consideran facturas. Cualquier otra cosa que caiga en
+# Entrada (un .md, un .txt, un .docx...) se aparta a Error/ SIN llamar a Claude.
+EXTENSIONES_VALIDAS = {".pdf", ".jpg", ".jpeg", ".png", ".webp"}
 
 WEBDAV_BASE = f"{NEXTCLOUD_URL}/remote.php/dav/files/{NEXTCLOUD_USER}"
 AUTH = (NEXTCLOUD_USER, NEXTCLOUD_APP_PASSWORD)
@@ -136,6 +144,9 @@ def mover_archivo(nombre, carpeta_destino, nuevo_nombre=None):
     r.raise_for_status()
 
 def extraer_datos_factura_emitida(contenido_bytes, nombre_archivo):
+    # Freno de seguridad: tope diario y límite de intentos por archivo.
+    guardia_claude.autorizar_llamada(nombre_archivo, contenido_bytes)
+
     extension = os.path.splitext(nombre_archivo)[1].lower() or ".pdf"
     with tempfile.NamedTemporaryFile(suffix=extension, delete=False) as f:
         f.write(contenido_bytes)
@@ -143,7 +154,8 @@ def extraer_datos_factura_emitida(contenido_bytes, nombre_archivo):
     try:
         prompt_completo = f"{PROMPT_EXTRACCION_EMITIDA}\n\nLee el archivo {ruta_temporal} y responde solo con el JSON, según las instrucciones anteriores."
         resultado = subprocess.run(
-            [CLAUDE_CODE_BIN, "-p", prompt_completo, "--allowedTools", "Read"],
+            [CLAUDE_CODE_BIN, "-p", prompt_completo, "--allowedTools", "Read",
+             "--model", CLAUDE_CODE_MODEL, "--max-turns", CLAUDE_CODE_MAX_TURNS],
             capture_output=True, text=True, timeout=CLAUDE_CODE_TIMEOUT,
         )
         if resultado.returncode != 0:
@@ -186,10 +198,25 @@ def main():
     if not pendientes:
         print("No hay facturas emitidas nuevas.")
         return
+    if guardia_claude.tope_alcanzado():
+        print(f"Tope diario de llamadas a Claude alcanzado — {len(pendientes)} archivo(s) esperan en Entrada hasta mañana.")
+        return
     for nombre in pendientes:
         print(f"Procesando: {nombre}")
+        extension = os.path.splitext(nombre)[1].lower()
+        if extension not in EXTENSIONES_VALIDAS:
+            print(f"  OMITIDO: no es una factura (extensión '{extension or 'ninguna'}') — se aparta a Error/ sin llamar a Claude")
+            try:
+                mover_archivo(nombre, CARPETA_ERROR)
+            except Exception as e2:
+                print(f"  No se pudo mover a Error/: {e2}")
+            continue
         try:
             procesar_uno(nombre)
+            guardia_claude.registrar_exito(nombre)
+        except guardia_claude.TopeDiario as e:
+            print(f"  PARADO: {e}. El resto queda en Entrada, sin tocar, hasta mañana.")
+            break
         except Exception as e:
             print(f"  ERROR con {nombre}: {e}")
             try:
