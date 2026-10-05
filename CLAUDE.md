@@ -26,7 +26,7 @@ Faltan en el repo: `run.sh`, `.env`, `src/core/` (`AuthContext`, `Login`, `api`)
 - Ruta de despliegue: `/opt/print3d/` (facturas en `/opt/print3d/facturas/`, con `venv/` y `.env`).
 - Nextcloud en Docker (contenedor `nextcloud`, `https://localhost:8083`, público en `cloud.myrox.es`).
 - Contenedor `gluetun` (VPN). Al reiniciar Nextcloud se paró y hubo que volver a arrancarlo.
-- Los scripts de facturas se lanzan **cada 2 minutos**, pero no desde el crontab de root (está vacío): hay que localizar desde dónde. Los logs están en
+- Los scripts de facturas se lanzan cada 2 minutos desde el crontab de root (`run.sh` y `run_emitidas.sh`). Los logs están en
   `/opt/print3d/facturas/log.txt` (recibidas) y `log_emitidas.txt` (emitidas).
 - La extracción de datos de las facturas usa Claude Code en local (`claude -p --allowedTools Read`).
 
@@ -51,11 +51,13 @@ Faltan en el repo: `run.sh`, `.env`, `src/core/` (`AuthContext`, `Login`, `api`)
   Se resolvió con `docker restart nextcloud`. Falta investigar qué hacían esos workers. La hipótesis es que no sea
   la tanda normal de peticiones WebDAV de los cron, sino algo atascado desde hace días.
   Si se repite, revisar el log de Nextcloud en el momento exacto en que pase **antes** de reiniciar.
-- **Gasto descontrolado de Claude (5-oct-2026):** un proceso estuvo llamando a `claude -p` sin parar y agotó el uso semanal.
-  Con el guardia anterior, un archivo que se procesaba bien pero seguía en Entrada volvía a llamar a Claude en cada pasada
-  (hasta 60 al día, 420 a la semana). Se ha endurecido `guardia_claude.py`: nunca se repite un contenido ya procesado,
-  hay tope diario (20) y semanal (80), se para solo si Claude avisa de límite de uso y existe el interruptor `PARAR`.
-  Falta desplegarlo y confirmar la causa con los logs del servidor.
+- **Uso semanal de Claude agotado (5-oct-2026):** se sospechó de los scripts de facturas, pero **no fueron ellos**.
+  Las llamadas a `claude -p` desde el servidor fueron 86 el 23-sep, 38 el 24-sep y 24 el 1-oct, y ninguna después.
+  La semana de uso actual va del 3-oct al 10-oct a las 17:00, así que el gasto vino del uso interactivo (chat y Claude Code).
+  Aun así se encontró un agujero real en el guardia (un archivo procesado que seguía en Entrada podía repetirse
+  hasta 60 veces al día) y se endureció `guardia_claude.py`. Falta desplegarlo; en el servidor sigue la versión del 4-oct.
+  Cada llamada de factura pesa unos 260 KB de sesión, que es mucho: conviene revisarlo.
+- El cron de root se ha quitado (5-oct). Hay que restaurarlo después de desplegar el guardia nuevo.
 
 ## Convenciones
 
