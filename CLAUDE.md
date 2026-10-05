@@ -9,15 +9,16 @@ Usuarios de la app: **Christian** (rol `master`), **Santi** y **Belén**.
 
 | Archivo | Qué es |
 |---|---|
-| `app_v19.py` | Backend único en FastAPI: analizador de piezas 3D, presupuestos, proyectos, clientes, stock, facturas, contabilidad, usuarios y el módulo "Mi Piso". SQLite en `/opt/print3d/data.db` y config en `/opt/print3d/config.json` |
-| `procesar_facturas_emitidas.py` | Procesa las facturas **emitidas** (ingresos) que llegan a Nextcloud |
-| `run.sh` | Lanzador por cron del procesador de facturas **recibidas** (`procesar_facturas.py`) |
-| `logo_myrox_*.png` | Logos de cada marca |
+| `app_v19.py` | Backend único en FastAPI: analizador de piezas 3D, presupuestos, proyectos, clientes, stock, facturas, contabilidad, ventas menores, usuarios y "Mi Piso". SQLite en `/opt/print3d/data.db` y config en `/opt/print3d/config.json` |
+| `procesar_facturas.py` | Procesa las facturas **recibidas** (proveedores) que llegan a Nextcloud |
+| `procesar_facturas_emitidas.py` | Procesa las facturas **emitidas** (ingresos) |
+| `guardia_claude.py` | Freno de gasto compartido por los dos procesadores: tope diario de llamadas a `claude -p` e intentos por archivo |
+| `run_emitidas.sh` | Lanzador por cron de las emitidas. Comparte el candado `/tmp/procesar_facturas.lock` con `run.sh` (recibidas, que solo está en el servidor) |
+| `*.jsx` y carpetas por módulo | Frontend React + Tailwind. En el servidor van en `src/modules/<modulo>/` y `src/core/`, pero aquí están subidos en plano |
 
-Las versiones antiguas (`app.py`, `app_v11`…`app_v18`, `Contabilidad.jsx`) se borraron. La vigente es `app_v19.py`.
+Faltan en el repo: `run.sh`, `.env`, `src/core/` (`AuthContext`, `Login`, `api`), `package.json` y la configuración del build.
 
-**Viven solo en el servidor (no están en el repo):** `procesar_facturas.py` (facturas recibidas),
-`run_emitidas.sh`, `.env` y el frontend. Si hay que tocarlos, pedir que se peguen o se suban.
+`Contabilidad.jsx` y `Usuarios.jsx` están **duplicados**, en la raíz y en su carpeta, con versiones distintas. Hay que confirmar cuál es la buena.
 
 ## Servidor (host `MW3D`)
 
