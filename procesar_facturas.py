@@ -52,6 +52,9 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")  # ya no es obligatoria 
 USAR_CLAUDE_CODE = os.environ.get("USAR_CLAUDE_CODE", "false").lower() == "true"
 CLAUDE_CODE_BIN = os.environ.get("CLAUDE_CODE_BIN", "/usr/bin/claude")
 CLAUDE_CODE_TIMEOUT = int(os.environ.get("CLAUDE_CODE_TIMEOUT", "120"))
+# Ninguna llamada a Nextcloud o al backend puede quedarse esperando para siempre:
+# si se cuelga, el candado del cron se quedaría cogido y nadie se enteraría.
+TIMEOUT_HTTP = int(os.environ.get("TIMEOUT_HTTP", "60"))
 # Sin fijar modelo, `claude -p` usa el que tenga la cuenta por defecto (puede ser
 # el más caro). Para extraer datos de una factura basta uno intermedio.
 CLAUDE_CODE_MODEL = os.environ.get("CLAUDE_CODE_MODEL", "sonnet")
@@ -173,7 +176,7 @@ def listar_facturas_pendientes():
     headers = {"Depth": "1", "Content-Type": "application/xml"}
     body = """<?xml version="1.0"?>
     <d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/><d:getcontenttype/></d:prop></d:propfind>"""
-    r = requests.request("PROPFIND", url, auth=AUTH, headers=headers, data=body)
+    r = requests.request("PROPFIND", url, auth=AUTH, headers=headers, data=body, timeout=TIMEOUT_HTTP)
     r.raise_for_status()
     import xml.etree.ElementTree as ET
     ns = {"d": "DAV:"}
@@ -196,7 +199,7 @@ def listar_facturas_pendientes():
 
 def descargar_archivo(nombre):
     url = f"{WEBDAV_BASE}{CARPETA_ENTRADA}/{quote(nombre)}"
-    r = requests.get(url, auth=AUTH)
+    r = requests.get(url, auth=AUTH, timeout=TIMEOUT_HTTP)
     r.raise_for_status()
     return r.content
 
@@ -207,13 +210,13 @@ def _asegurar_carpetas(ruta_carpeta):
     actual = ""
     for parte in partes:
         actual += f"/{parte}"
-        requests.request("MKCOL", f"{WEBDAV_BASE}{actual}", auth=AUTH)
+        requests.request("MKCOL", f"{WEBDAV_BASE}{actual}", auth=AUTH, timeout=TIMEOUT_HTTP)
 
 def mover_archivo(nombre, carpeta_destino, nuevo_nombre=None):
     origen = f"{WEBDAV_BASE}{CARPETA_ENTRADA}/{quote(nombre)}"
     _asegurar_carpetas(carpeta_destino)
     destino = f"{WEBDAV_BASE}{carpeta_destino}/{quote(nuevo_nombre or nombre)}"
-    r = requests.request("MOVE", origen, auth=AUTH, headers={"Destination": destino, "Overwrite": "T"})
+    r = requests.request("MOVE", origen, auth=AUTH, headers={"Destination": destino, "Overwrite": "T"}, timeout=TIMEOUT_HTTP)
     r.raise_for_status()
 
 def mover_ruta_completa(ruta_relativa_origen, carpeta_destino, nuevo_nombre):
@@ -224,7 +227,7 @@ def mover_ruta_completa(ruta_relativa_origen, carpeta_destino, nuevo_nombre):
     origen = f"{WEBDAV_BASE}/{quote(ruta_relativa_origen)}"
     _asegurar_carpetas(carpeta_destino)
     destino = f"{WEBDAV_BASE}{carpeta_destino}/{quote(nuevo_nombre)}"
-    r = requests.request("MOVE", origen, auth=AUTH, headers={"Destination": destino, "Overwrite": "T"})
+    r = requests.request("MOVE", origen, auth=AUTH, headers={"Destination": destino, "Overwrite": "T"}, timeout=TIMEOUT_HTTP)
     r.raise_for_status()
 
 def _limpiar_y_parsear_json(texto):
@@ -234,6 +237,8 @@ def _limpiar_y_parsear_json(texto):
     return json.loads(texto)
 
 def _extraer_via_api(contenido_bytes, nombre_archivo):
+    # Por API se paga por token: mismo freno que con Claude Code.
+    guardia_claude.autorizar_llamada(nombre_archivo, contenido_bytes)
     media_type = "application/pdf" if nombre_archivo.lower().endswith(".pdf") else "image/jpeg"
     tipo_bloque = "document" if media_type == "application/pdf" else "image"
     b64 = base64.b64encode(contenido_bytes).decode()
@@ -255,7 +260,8 @@ def _extraer_via_api(contenido_bytes, nombre_archivo):
                     {"type": "text", "text": PROMPT_EXTRACCION}
                 ]
             }]
-        }
+        },
+        timeout=CLAUDE_CODE_TIMEOUT,
     )
     resp.raise_for_status()
     bloques = resp.json()["content"]
@@ -289,6 +295,9 @@ def _extraer_via_claude_code(contenido_bytes, nombre_archivo):
              "--model", CLAUDE_CODE_MODEL, "--max-turns", CLAUDE_CODE_MAX_TURNS],
             capture_output=True, text=True, timeout=CLAUDE_CODE_TIMEOUT,
         )
+        if resultado.returncode != 0 or not resultado.stdout.strip():
+            # Si Claude dice que se ha acabado el uso, se bloquea todo hasta mañana
+            guardia_claude.revisar_salida_claude(resultado.stdout + resultado.stderr)
         if resultado.returncode != 0:
             raise RuntimeError(f"{CLAUDE_CODE_BIN} -p terminó con error (código {resultado.returncode}): {resultado.stderr.strip()}")
         if not resultado.stdout.strip():
@@ -311,7 +320,7 @@ def subir_archivo(ruta_relativa, contenido_bytes):
     if carpeta:
         _asegurar_carpetas(carpeta)
     url = f"{WEBDAV_BASE}/{quote(ruta_relativa)}"
-    r = requests.put(url, auth=AUTH, data=contenido_bytes)
+    r = requests.put(url, auth=AUTH, data=contenido_bytes, timeout=TIMEOUT_HTTP)
     r.raise_for_status()
 
 def dividir_pdf(contenido_bytes, pagina_inicio, pagina_fin):
@@ -508,7 +517,7 @@ def _importar_una_factura(datos_factura):
             datos_factura["tipo"] = "otro"
             necesita_clasificacion_ia = True
 
-    r = requests.post(f"{MYROX_API_URL}/facturas/importar", json=datos_factura)
+    r = requests.post(f"{MYROX_API_URL}/facturas/importar", json=datos_factura, timeout=TIMEOUT_HTTP)
     r.raise_for_status()
     resultado = r.json()
 
@@ -625,7 +634,7 @@ def main():
     if not pendientes:
         print("No hay facturas nuevas.")
         return
-    if USAR_CLAUDE_CODE and guardia_claude.tope_alcanzado():
+    if guardia_claude.tope_alcanzado():
         print(f"Tope diario de llamadas a Claude alcanzado — {len(pendientes)} archivo(s) esperan en Entrada hasta mañana.")
         return
     todas_criticas = []
@@ -642,6 +651,12 @@ def main():
         try:
             todas_criticas.extend(procesar_uno(nombre))
             guardia_claude.registrar_exito(nombre)
+        except guardia_claude.YaProcesado as e:
+            print(f"  YA PROCESADO: {e} — se aparta a Duplicada/ sin gastar nada")
+            try:
+                mover_archivo(nombre, CARPETA_DUPLICADA)
+            except Exception as e2:
+                print(f"  No se pudo mover a Duplicada/: {e2}")
         except guardia_claude.TopeDiario as e:
             print(f"  PARADO: {e}. El resto queda en Entrada, sin tocar, hasta mañana.")
             break

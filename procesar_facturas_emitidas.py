@@ -36,6 +36,9 @@ NEXTCLOUD_APP_PASSWORD = os.environ["NEXTCLOUD_APP_PASSWORD"]
 MYROX_API_URL = os.environ["MYROX_API_URL"].rstrip("/")
 CLAUDE_CODE_BIN = os.environ.get("CLAUDE_CODE_BIN", "/usr/bin/claude")
 CLAUDE_CODE_TIMEOUT = int(os.environ.get("CLAUDE_CODE_TIMEOUT", "120"))
+# Ninguna llamada a Nextcloud o al backend puede quedarse esperando para siempre:
+# si se cuelga, el candado del cron se quedaría cogido y nadie se enteraría.
+TIMEOUT_HTTP = int(os.environ.get("TIMEOUT_HTTP", "60"))
 # Sin fijar modelo, `claude -p` usa el que tenga la cuenta por defecto (puede ser
 # el más caro). Para extraer datos de una factura basta uno intermedio.
 CLAUDE_CODE_MODEL = os.environ.get("CLAUDE_CODE_MODEL", "sonnet")
@@ -107,7 +110,7 @@ def listar_facturas_pendientes():
     headers = {"Depth": "1", "Content-Type": "application/xml"}
     body = """<?xml version="1.0"?>
     <d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/><d:getcontenttype/></d:prop></d:propfind>"""
-    r = requests.request("PROPFIND", url, auth=AUTH, headers=headers, data=body)
+    r = requests.request("PROPFIND", url, auth=AUTH, headers=headers, data=body, timeout=TIMEOUT_HTTP)
     r.raise_for_status()
     import xml.etree.ElementTree as ET
     ns = {"d": "DAV:"}
@@ -125,7 +128,7 @@ def listar_facturas_pendientes():
 
 def descargar_archivo(nombre):
     url = f"{WEBDAV_BASE}{CARPETA_ENTRADA}/{quote(nombre)}"
-    r = requests.get(url, auth=AUTH)
+    r = requests.get(url, auth=AUTH, timeout=TIMEOUT_HTTP)
     r.raise_for_status()
     return r.content
 
@@ -134,13 +137,13 @@ def _asegurar_carpetas(ruta_carpeta):
     actual = ""
     for parte in partes:
         actual += f"/{parte}"
-        requests.request("MKCOL", f"{WEBDAV_BASE}{actual}", auth=AUTH)
+        requests.request("MKCOL", f"{WEBDAV_BASE}{actual}", auth=AUTH, timeout=TIMEOUT_HTTP)
 
 def mover_archivo(nombre, carpeta_destino, nuevo_nombre=None):
     origen = f"{WEBDAV_BASE}{CARPETA_ENTRADA}/{quote(nombre)}"
     _asegurar_carpetas(carpeta_destino)
     destino = f"{WEBDAV_BASE}{carpeta_destino}/{quote(nuevo_nombre or nombre)}"
-    r = requests.request("MOVE", origen, auth=AUTH, headers={"Destination": destino, "Overwrite": "T"})
+    r = requests.request("MOVE", origen, auth=AUTH, headers={"Destination": destino, "Overwrite": "T"}, timeout=TIMEOUT_HTTP)
     r.raise_for_status()
 
 def extraer_datos_factura_emitida(contenido_bytes, nombre_archivo):
@@ -158,6 +161,9 @@ def extraer_datos_factura_emitida(contenido_bytes, nombre_archivo):
              "--model", CLAUDE_CODE_MODEL, "--max-turns", CLAUDE_CODE_MAX_TURNS],
             capture_output=True, text=True, timeout=CLAUDE_CODE_TIMEOUT,
         )
+        if resultado.returncode != 0 or not resultado.stdout.strip():
+            # Si Claude dice que se ha acabado el uso, se bloquea todo hasta mañana
+            guardia_claude.revisar_salida_claude(resultado.stdout + resultado.stderr)
         if resultado.returncode != 0:
             raise RuntimeError(f"{CLAUDE_CODE_BIN} -p terminó con error (código {resultado.returncode}): {resultado.stderr.strip()}")
         if not resultado.stdout.strip():
@@ -170,7 +176,7 @@ def extraer_datos_factura_emitida(contenido_bytes, nombre_archivo):
         os.unlink(ruta_temporal)
 
 def importar_factura_emitida(datos, archivo):
-    r = requests.post(f"{MYROX_API_URL}/facturas-emitidas/importar", json={**datos, "archivo": archivo})
+    r = requests.post(f"{MYROX_API_URL}/facturas-emitidas/importar", json={**datos, "archivo": archivo}, timeout=TIMEOUT_HTTP)
     r.raise_for_status()
     return r.json()
 
@@ -214,6 +220,12 @@ def main():
         try:
             procesar_uno(nombre)
             guardia_claude.registrar_exito(nombre)
+        except guardia_claude.YaProcesado as e:
+            print(f"  YA PROCESADO: {e} — se aparta a Duplicada/ sin gastar nada")
+            try:
+                mover_archivo(nombre, CARPETA_DUPLICADA)
+            except Exception as e2:
+                print(f"  No se pudo mover a Duplicada/: {e2}")
         except guardia_claude.TopeDiario as e:
             print(f"  PARADO: {e}. El resto queda en Entrada, sin tocar, hasta mañana.")
             break

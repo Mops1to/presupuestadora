@@ -50,8 +50,11 @@ Faltan en el repo: `run.sh`, `.env`, `src/core/` (`AuthContext`, `Login`, `api`)
   Se resolvió con `docker restart nextcloud`. Falta investigar qué hacían esos workers. La hipótesis es que no sea
   la tanda normal de peticiones WebDAV de los cron, sino algo atascado desde hace días.
   Si se repite, revisar el log de Nextcloud en el momento exacto en que pase **antes** de reiniciar.
-- Ninguna llamada `requests` de `procesar_facturas_emitidas.py` tiene `timeout`. Si Nextcloud se cuelga, el script
-  se queda esperando indefinidamente y el candado `flock` deja saltar todas las pasadas siguientes sin avisar.
+- **Gasto descontrolado de Claude (5-oct-2026):** un proceso estuvo llamando a `claude -p` sin parar y agotó el uso semanal.
+  Con el guardia anterior, un archivo que se procesaba bien pero seguía en Entrada volvía a llamar a Claude en cada pasada
+  (hasta 60 al día, 420 a la semana). Se ha endurecido `guardia_claude.py`: nunca se repite un contenido ya procesado,
+  hay tope diario (20) y semanal (80), se para solo si Claude avisa de límite de uso y existe el interruptor `PARAR`.
+  Falta desplegarlo y confirmar la causa con los logs del servidor.
 
 ## Convenciones
 
