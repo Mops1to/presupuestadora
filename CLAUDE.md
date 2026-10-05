@@ -20,12 +20,13 @@ Faltan en el repo: `run.sh`, `.env`, `src/core/` (`AuthContext`, `Login`, `api`)
 
 `Contabilidad.jsx` y `Usuarios.jsx` están **duplicados**, en la raíz y en su carpeta, con versiones distintas. Hay que confirmar cuál es la buena.
 
-## Servidor (host `MW3D`)
+## Servidores
 
+- Nextcloud y Docker están en el host `MW3D`. La app y los scripts de facturas, en el host `Presupuestadora`.
 - Ruta de despliegue: `/opt/print3d/` (facturas en `/opt/print3d/facturas/`, con `venv/` y `.env`).
 - Nextcloud en Docker (contenedor `nextcloud`, `https://localhost:8083`, público en `cloud.myrox.es`).
 - Contenedor `gluetun` (VPN). Al reiniciar Nextcloud se paró y hubo que volver a arrancarlo.
-- Los scripts de facturas se lanzan por cron **cada 2 minutos**. Los logs están en
+- Los scripts de facturas se lanzan **cada 2 minutos**, pero no desde el crontab de root (está vacío): hay que localizar desde dónde. Los logs están en
   `/opt/print3d/facturas/log.txt` (recibidas) y `log_emitidas.txt` (emitidas).
 - La extracción de datos de las facturas usa Claude Code en local (`claude -p --allowedTools Read`).
 
