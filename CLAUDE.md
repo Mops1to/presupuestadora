@@ -53,7 +53,8 @@ Faltan en el repo: `run.sh`, `.env`, `src/core/` (`AuthContext`, `Login`, `api`)
   Si se repite, revisar el log de Nextcloud en el momento exacto en que pase **antes** de reiniciar.
 - **Uso semanal de Claude agotado (5-oct-2026):** se sospechó de los scripts de facturas, pero **no fueron ellos**.
   Las llamadas a `claude -p` desde el servidor fueron 86 el 23-sep, 38 el 24-sep y 24 el 1-oct, y ninguna después.
-  La semana de uso actual va del 3-oct al 10-oct a las 17:00, así que el gasto vino del uso interactivo (chat y Claude Code).
+  La semana de uso actual va del 3-oct al 10-oct a las 17:00, y en el servidor no hay ninguna sesión de Claude Code posterior al 3-oct (comprobado con `find`). La pantalla de uso
+  marcaba Claude Code 100 % y Chats 0 %, así que el gasto vino de sesiones de Claude Code en la web o en la app de escritorio.
   Aun así se encontró un agujero real en el guardia (un archivo procesado que seguía en Entrada podía repetirse
   hasta 60 veces al día) y se endureció `guardia_claude.py`. Falta desplegarlo; en el servidor sigue la versión del 4-oct.
   Cada llamada de factura pesa unos 260 KB de sesión, que es mucho: conviene revisarlo.
